@@ -26,6 +26,15 @@ STATUS_LABELS = {
     "done": "✅ Выполнено",
 }
 
+STATUS_EMOJI = {
+    "inbox": "📥",
+    "next_action": "▶️",
+    "waiting_for": "⏳",
+    "calendar": "📅",
+    "someday": "🌫",
+    "done": "✅",
+}
+
 PRIORITY_LABELS = {"A": "🔴A", "B": "🟡B", "C": "🟢C"}
 
 

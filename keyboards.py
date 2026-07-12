@@ -15,6 +15,8 @@ BTN_ADD = "📥 Новая задача"
 BTN_PROCESS = "📋 Обработать Inbox"
 BTN_NOW = "❓ Что делать сейчас"
 BTN_PLAN = "📅 План"
+BTN_ALL = "🗂 Все задачи"
+BTN_DONE_LOG = "🏁 Сделано"
 BTN_DO = "✅ Отметить сделанным"
 BTN_SEARCH = "🔍 Поиск"
 
@@ -24,6 +26,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_PROCESS)],
             [KeyboardButton(text=BTN_NOW), KeyboardButton(text=BTN_PLAN)],
+            [KeyboardButton(text=BTN_ALL), KeyboardButton(text=BTN_DONE_LOG)],
             [KeyboardButton(text=BTN_DO), KeyboardButton(text=BTN_SEARCH)],
         ],
         resize_keyboard=True,
@@ -219,6 +222,7 @@ def edit_field_kb() -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="Контексты", callback_data="edit:field:contexts"))
     builder.row(InlineKeyboardButton(text="Приоритет", callback_data="edit:field:priority"))
     builder.row(InlineKeyboardButton(text="Дедлайн", callback_data="edit:field:deadline"))
+    builder.row(InlineKeyboardButton(text="🗑 Удалить задачу", callback_data="edit:delete"))
     builder.row(InlineKeyboardButton(text="✅ Завершить", callback_data="edit:finish"))
     return builder.as_markup()
 
@@ -239,4 +243,77 @@ def edit_status_kb() -> InlineKeyboardMarkup:
             continue
         builder.row(InlineKeyboardButton(text=label, callback_data=f"edit:status:{status}"))
     _back_cancel_row(builder, "edit:back", "edit:cancel")
+    return builder.as_markup()
+
+
+# ---------- «Все задачи»: просмотр/редактирование в любой категории ----------
+
+ALL_TASKS_FILTERS = [
+    ("all", "Все"),
+    ("inbox", "📥 Inbox"),
+    ("next_action", "▶️ Next"),
+    ("waiting_for", "⏳ Waiting"),
+    ("calendar", "📅 Calendar"),
+    ("someday", "🌫 Someday"),
+]
+
+
+def all_tasks_kb(tasks_page: list[dict], page: int, total_pages: int, status_filter: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    buttons = [
+        InlineKeyboardButton(
+            text=("• " + label) if value == status_filter else label,
+            callback_data=f"all:filter:{value}",
+        )
+        for value, label in ALL_TASKS_FILTERS
+    ]
+    builder.row(*buttons[:3])
+    builder.row(*buttons[3:])
+    for task in tasks_page:
+        emoji = utils.STATUS_EMOJI.get(task["status"], "")
+        title = task["title"] if len(task["title"]) <= 34 else task["title"][:31] + "…"
+        label = f"{emoji} {utils.PRIORITY_LABELS.get(task['priority'], '')} {title}".replace("  ", " ").strip()
+        builder.row(InlineKeyboardButton(text=label, callback_data=f"edit:pick:{task['id']}"))
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"all:page:{status_filter}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="Далее »", callback_data=f"all:page:{status_filter}:{page + 1}"))
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="✖️ Закрыть", callback_data="all:cancel"))
+    return builder.as_markup()
+
+
+# ---------- /done: что уже сделано ----------
+
+def done_period_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="Сегодня", callback_data="done:period:today"),
+        InlineKeyboardButton(text="Вчера", callback_data="done:period:yesterday"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="7 дней", callback_data="done:period:week"),
+        InlineKeyboardButton(text="Всё время", callback_data="done:period:all"),
+    )
+    return builder.as_markup()
+
+
+DONE_SORTS = [("time", "🕐 Время"), ("priority", "🔥 Приоритет"), ("title", "🔤 Название")]
+
+
+def done_results_kb(sort_key: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    row = [
+        InlineKeyboardButton(
+            text=("• " + label) if value == sort_key else label,
+            callback_data=f"done:sort:{value}",
+        )
+        for value, label in DONE_SORTS
+    ]
+    builder.row(*row)
+    builder.row(InlineKeyboardButton(text="🔁 Другой период", callback_data="done:restart"))
+    builder.row(InlineKeyboardButton(text="✖️ Закрыть", callback_data="done:cancel"))
     return builder.as_markup()

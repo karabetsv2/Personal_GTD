@@ -213,6 +213,20 @@ async def list_all_tasks_excluding_done() -> list[dict]:
     return _rows_to_dicts(await cursor.fetchall())
 
 
+async def list_done_tasks_between(start_iso: str, end_iso: str) -> list[dict]:
+    cursor = await _conn.execute(
+        "SELECT * FROM tasks WHERE status = 'done' AND completed_at >= ? AND completed_at < ? "
+        "ORDER BY completed_at DESC",
+        (start_iso, end_iso),
+    )
+    return _rows_to_dicts(await cursor.fetchall())
+
+
+async def list_done_tasks_all() -> list[dict]:
+    cursor = await _conn.execute("SELECT * FROM tasks WHERE status = 'done' ORDER BY completed_at DESC")
+    return _rows_to_dicts(await cursor.fetchall())
+
+
 async def list_next_actions_for_now(max_minutes: int, location_groups: Optional[list[str]]) -> list[dict]:
     """Next Actions, подходящие по времени (контекст с minutes <= max_minutes) и месту.
 

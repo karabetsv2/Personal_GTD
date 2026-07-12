@@ -84,6 +84,34 @@ async def _cancel_shared_subflow(callback: CallbackQuery, state: FSMContext, wha
         await callback.message.answer("Отменено.", reply_markup=kb.main_menu_kb())
 
 
+async def _ask_delete_confirm(message_to_edit: Message, task: dict) -> None:
+    """Общий текст подтверждения удаления — переиспользуется из /delete, /search и /edit."""
+    reminder = await db.get_reminder_for_task(task["id"])
+    if reminder:
+        text = (
+            f"У задачи «{task['title']}» есть активное напоминание на "
+            f"{utils.format_dt(reminder['remind_at'])}. Удалить вместе с напоминанием?"
+        )
+    else:
+        text = f"Удалить «{task['title']}»?"
+    await message_to_edit.edit_text(text, reply_markup=kb.confirm_kb(f"del:yes:{task['id']}", f"del:no:{task['id']}"))
+
+
+async def _render_all_tasks(target, status_filter: str, page: int, edit: bool = False) -> None:
+    """Экран «Все задачи»: список в любой категории с фильтром по статусу и пагинацией."""
+    if status_filter == "all":
+        tasks = await db.list_all_tasks_excluding_done()
+    else:
+        tasks = await db.list_tasks_by_status(status_filter)
+    page_items, total_pages = _paginate(tasks, page)
+    text = f"Все задачи ({len(tasks)}), тронь любую, чтобы изменить или удалить:" if tasks else "Задач в этой категории нет."
+    markup = kb.all_tasks_kb(page_items, page, total_pages, status_filter)
+    if edit:
+        await target.edit_text(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
 # ==================== /start, /help, /cancel ====================
 
 HELP_TEXT = (
@@ -93,6 +121,8 @@ HELP_TEXT = (
     "/process — разобрать Inbox\n"
     "/now — что делать прямо сейчас\n"
     "/plan сегодня|завтра|неделя — план на период\n"
+    "/all — все задачи (любая категория), правка/удаление на месте\n"
+    "/done — что уже сделано, с сортировкой\n"
     "/do — отметить задачу выполненной\n"
     "/edit — изменить задачу\n"
     "/delete — удалить задачу\n"
@@ -200,6 +230,20 @@ async def cmd_search(message: Message, state: FSMContext, command: CommandObject
     else:
         await state.set_state(SearchTask.entering_query)
         await message.answer("Что ищем?", reply_markup=kb.single_cancel_kb("search:cancel"))
+
+
+@router.message(Command("all"))
+@router.message(F.text == kb.BTN_ALL)
+async def cmd_all_tasks(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _render_all_tasks(message, "all", 0)
+
+
+@router.message(Command("done"))
+@router.message(F.text == kb.BTN_DONE_LOG)
+async def cmd_done(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("За какой период показать сделанное?", reply_markup=kb.done_period_kb())
 
 
 # ==================== Быстрый захват: предложение запланировать ====================
@@ -769,6 +813,40 @@ async def edit_status_choice(callback: CallbackQuery, state: FSMContext) -> None
     await _show_edit_field_menu(callback.message, task_id, note=f"Список изменён: {utils.STATUS_LABELS[new_status]} ✅")
 
 
+@router.callback_query(F.data == "edit:delete")
+async def edit_delete(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    task_id = data.get("task_id")
+    task = await db.get_task(task_id) if task_id else None
+    if not task:
+        await callback.message.edit_text("Задача не найдена.")
+        return
+    await _ask_delete_confirm(callback.message, task)
+
+
+# ==================== «Все задачи» (просмотр/правка в любой категории) ====================
+
+@router.callback_query(F.data.startswith("all:filter:"))
+async def all_filter_choice(callback: CallbackQuery) -> None:
+    await callback.answer()
+    status_filter = callback.data[len("all:filter:"):]
+    await _render_all_tasks(callback.message, status_filter, 0, edit=True)
+
+
+@router.callback_query(F.data.startswith("all:page:"))
+async def all_page_choice(callback: CallbackQuery) -> None:
+    await callback.answer()
+    _, _, status_filter, page_str = callback.data.split(":")
+    await _render_all_tasks(callback.message, status_filter, int(page_str), edit=True)
+
+
+@router.callback_query(F.data == "all:cancel")
+async def all_cancel(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.edit_text("Ок.")
+
+
 # ==================== /delete ====================
 
 @router.callback_query(F.data.startswith("del:pick:"))
@@ -779,15 +857,7 @@ async def del_pick(callback: CallbackQuery) -> None:
     if not task:
         await callback.message.edit_text("Задача уже удалена.")
         return
-    reminder = await db.get_reminder_for_task(task_id)
-    if reminder:
-        text = (
-            f"У задачи «{task['title']}» есть активное напоминание на "
-            f"{utils.format_dt(reminder['remind_at'])}. Удалить вместе с напоминанием?"
-        )
-    else:
-        text = f"Удалить «{task['title']}»?"
-    await callback.message.edit_text(text, reply_markup=kb.confirm_kb(f"del:yes:{task_id}", f"del:no:{task_id}"))
+    await _ask_delete_confirm(callback.message, task)
 
 
 @router.callback_query(F.data.startswith("del:yes:"))
@@ -917,6 +987,94 @@ async def plan_period_choice(callback: CallbackQuery) -> None:
     await callback.answer()
     period = callback.data[len("plan:"):]
     await _send_plan(callback.message, period)
+
+
+# ==================== /done: что уже сделано ====================
+
+_DONE_MAX_ROWS = 40  # защита от слишком длинного сообщения при периоде «Всё время»
+
+
+def _done_period_range(period: str):
+    today = utils.now_local().date()
+    if period == "today":
+        start = datetime.combine(today, time.min, tzinfo=utils.TZ)
+        return start, start + timedelta(days=1), "сегодня"
+    if period == "yesterday":
+        start = datetime.combine(today - timedelta(days=1), time.min, tzinfo=utils.TZ)
+        return start, start + timedelta(days=1), "вчера"
+    if period == "week":
+        start = datetime.combine(today - timedelta(days=6), time.min, tzinfo=utils.TZ)
+        end = datetime.combine(today, time.min, tzinfo=utils.TZ) + timedelta(days=1)
+        return start, end, "последние 7 дней"
+    return None, None, "всё время"
+
+
+_PRIORITY_ORDER = {"A": 0, "B": 1, "C": 2, None: 3}
+
+
+def _sort_done_tasks(tasks: list[dict], sort_key: str) -> list[dict]:
+    if sort_key == "priority":
+        return sorted(tasks, key=lambda t: (_PRIORITY_ORDER.get(t["priority"], 3), t["completed_at"] or ""))
+    if sort_key == "title":
+        return sorted(tasks, key=lambda t: t["title"].lower())
+    return sorted(tasks, key=lambda t: t["completed_at"] or "", reverse=True)
+
+
+async def _render_done(target, period: str, sort_key: str, edit: bool = False) -> None:
+    start, end, label = _done_period_range(period)
+    tasks = await db.list_done_tasks_all() if start is None else await db.list_done_tasks_between(
+        utils.dt_to_iso(start), utils.dt_to_iso(end)
+    )
+    tasks = _sort_done_tasks(tasks, sort_key)
+    truncated = len(tasks) > _DONE_MAX_ROWS
+    shown = tasks[:_DONE_MAX_ROWS]
+    if not shown:
+        text = f"За {label} ничего не выполнено."
+    else:
+        lines = [f"Сделано за {label} ({len(tasks)}):"]
+        for t in shown:
+            when = utils.format_dt(t["completed_at"]) if t.get("completed_at") else "?"
+            prio = utils.PRIORITY_LABELS.get(t["priority"], "")
+            lines.append(f"• {prio} {t['title']} — {when}".replace("  ", " "))
+        if truncated:
+            lines.append(f"… и ещё {len(tasks) - _DONE_MAX_ROWS}, сузь период, чтобы увидеть все")
+        text = "\n".join(lines)
+    markup = kb.done_results_kb(sort_key)
+    if edit:
+        await target.edit_text(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("done:period:"))
+async def done_period_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    period = callback.data[len("done:period:"):]
+    await state.update_data(done_period=period)
+    await _render_done(callback.message, period, "time", edit=True)
+
+
+@router.callback_query(F.data.startswith("done:sort:"))
+async def done_sort_choice(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    sort_key = callback.data[len("done:sort:"):]
+    data = await state.get_data()
+    period = data.get("done_period", "today")
+    await _render_done(callback.message, period, sort_key, edit=True)
+
+
+@router.callback_query(F.data == "done:restart")
+async def done_restart(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await callback.message.edit_text("За какой период показать сделанное?", reply_markup=kb.done_period_kb())
+
+
+@router.callback_query(F.data == "done:cancel")
+async def done_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await callback.message.edit_text("Ок.")
 
 
 # ==================== Служебное ====================
