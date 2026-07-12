@@ -5,12 +5,13 @@ from datetime import timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 import db
 import utils
-from handlers import router
+from handlers import BOT_COMMANDS, router
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ async def main() -> None:
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in BOT_COMMANDS])
         logger.info("Бот запущен, начинаю polling")
         await dp.start_polling(bot)
     finally:
