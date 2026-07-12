@@ -1,5 +1,6 @@
 """Слой доступа к данным: SQLite через aiosqlite, схема, сиды, CRUD."""
 import logging
+import os
 from datetime import timedelta
 from typing import Optional
 
@@ -93,6 +94,17 @@ def _rows_to_dicts(rows) -> list[dict]:
 async def init_db() -> None:
     """Открывает соединение, создаёт схему и сеет базовые контексты (если их ещё нет)."""
     global _conn
+    db_dir = os.path.dirname(config.DATABASE_PATH)
+    if db_dir:
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except OSError:
+            logger.exception(
+                "Не удалось создать директорию для БД %s — проверь права доступа "
+                "(например, к смонтированному Railway Volume)",
+                db_dir,
+            )
+            raise
     _conn = await aiosqlite.connect(config.DATABASE_PATH)
     _conn.row_factory = aiosqlite.Row
     await _conn.execute("PRAGMA foreign_keys = ON")
