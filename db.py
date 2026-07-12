@@ -105,6 +105,12 @@ async def init_db() -> None:
                 db_dir,
             )
             raise
+    if os.path.exists(config.DATABASE_PATH):
+        size = os.path.getsize(config.DATABASE_PATH)
+        logger.info("Найден существующий файл БД %s (%d байт)", config.DATABASE_PATH, size)
+    else:
+        logger.info("Файл БД %s не найден, будет создан с нуля", config.DATABASE_PATH)
+
     _conn = await aiosqlite.connect(config.DATABASE_PATH)
     _conn.row_factory = aiosqlite.Row
     await _conn.execute("PRAGMA foreign_keys = ON")
