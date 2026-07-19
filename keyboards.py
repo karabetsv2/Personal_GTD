@@ -19,6 +19,8 @@ BTN_ALL = "🗂 Все задачи"
 BTN_DONE_LOG = "🏁 Сделано"
 BTN_DO = "✅ Отметить сделанным"
 BTN_SEARCH = "🔍 Поиск"
+BTN_BALANCE = "⚖️ Баланс"
+BTN_COACH = "🧭 Коуч"
 
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -28,6 +30,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_NOW), KeyboardButton(text=BTN_PLAN)],
             [KeyboardButton(text=BTN_ALL), KeyboardButton(text=BTN_DONE_LOG)],
             [KeyboardButton(text=BTN_DO), KeyboardButton(text=BTN_SEARCH)],
+            [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_COACH)],
         ],
         resize_keyboard=True,
     )
@@ -64,9 +67,52 @@ def inbox_action_kb(task_id: int) -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="📅 Запланировать", callback_data=f"proc:schedule:{task_id}"))
     builder.row(InlineKeyboardButton(text="▶️ Следующее действие", callback_data=f"proc:next:{task_id}"))
     builder.row(InlineKeyboardButton(text="⏳ Ждём от кого-то", callback_data=f"proc:waiting:{task_id}"))
+    builder.row(InlineKeyboardButton(text="📁 Это проект", callback_data=f"proc:project:{task_id}"))
     builder.row(InlineKeyboardButton(text="🌫 Когда-нибудь", callback_data=f"proc:someday:{task_id}"))
     builder.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"proc:delete:{task_id}"))
     builder.row(InlineKeyboardButton(text="✖️ Отмена", callback_data="proc:cancel"))
+    return builder.as_markup()
+
+
+# ---------- Разбивка проекта на действия (ИИ или вручную) ----------
+
+def project_breakdown_choice_kb(project_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🤖 Предложить разбивку с ИИ", callback_data=f"projbrk:ai:{project_id}"))
+    builder.row(InlineKeyboardButton(text="✍️ Добавить вручную", callback_data=f"projbrk:manual:{project_id}"))
+    builder.row(InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"projbrk:skip:{project_id}"))
+    return builder.as_markup()
+
+
+def ai_fallback_kb(project_id: int) -> InlineKeyboardMarkup:
+    """Показывается, если запрос к ИИ не удался — тот же выбор без кнопки «с ИИ»."""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✍️ Добавить вручную", callback_data=f"projbrk:manual:{project_id}"))
+    builder.row(InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"projbrk:skip:{project_id}"))
+    return builder.as_markup()
+
+
+def suggestion_review_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Принять", callback_data="projbrk:accept"),
+        InlineKeyboardButton(text="✏️ Изменить", callback_data="projbrk:edit"),
+    )
+    builder.row(InlineKeyboardButton(text="❌ Отклонить", callback_data="projbrk:reject"))
+    return builder.as_markup()
+
+
+def manual_action_entry_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✅ Готово", callback_data="projbrk:manualdone"))
+    return builder.as_markup()
+
+
+# ---------- Коуч ----------
+
+def coach_exit_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⏹ Закончить", callback_data="coach:exit"))
     return builder.as_markup()
 
 

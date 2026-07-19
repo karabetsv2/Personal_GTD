@@ -33,3 +33,15 @@ class EditTask(StatesGroup):
 
 class SearchTask(StatesGroup):
     entering_query = State()
+
+
+class ProjectBreakdown(StatesGroup):
+    """Разбивка проекта на действия — ИИ-черновик или ручной ввод (/process → «Это проект»)."""
+    entering_manual_action = State()
+    editing_suggestion = State()
+
+
+class CoachChat(StatesGroup):
+    """Свободный чат с ИИ-коучем. Единственное место, где произвольный текст не должен
+    попадать в общий quick-capture — перехватывается этим состоянием раньше catch-all."""
+    chatting = State()

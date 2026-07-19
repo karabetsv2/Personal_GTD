@@ -8,11 +8,20 @@ from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+import ai_client
 import config
 import db
 import keyboards as kb
 import utils
-from states import ContextPick, EditTask, ProcessInbox, ScheduleTask, SearchTask
+from states import (
+    CoachChat,
+    ContextPick,
+    EditTask,
+    ProcessInbox,
+    ProjectBreakdown,
+    ScheduleTask,
+    SearchTask,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -127,7 +136,11 @@ HELP_TEXT = (
     "/edit — изменить задачу\n"
     "/delete — удалить задачу\n"
     "/search текст — найти задачу\n"
-    "/cancel — отменить текущее действие"
+    "/balance — анализ баланса по спискам за 30 дней (ИИ)\n"
+    "/coach — чат с ИИ-коучем по продуктивности\n"
+    "/cancel — отменить текущее действие\n\n"
+    "В /process у задачи есть кнопка «Это проект» — предложит разбивку "
+    "на следующие действия через ИИ или дай добавить их вручную."
 )
 
 # Список команд для синей кнопки «Menu» в Telegram — задаётся программно через
@@ -144,6 +157,8 @@ BOT_COMMANDS = [
     ("edit", "Изменить задачу"),
     ("delete", "Удалить задачу"),
     ("search", "Найти задачу"),
+    ("balance", "Анализ баланса за 30 дней (ИИ)"),
+    ("coach", "Чат с ИИ-коучем"),
     ("cancel", "Отменить текущее действие"),
     ("help", "Список команд"),
 ]
@@ -264,6 +279,27 @@ async def cmd_done(message: Message, state: FSMContext) -> None:
     await message.answer("За какой период показать сделанное?", reply_markup=kb.done_period_kb())
 
 
+@router.message(Command("balance"))
+@router.message(F.text == kb.BTN_BALANCE)
+async def cmd_balance(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Анализирую последние 30 дней…")
+    report = await build_balance_report()
+    await message.answer(report, reply_markup=kb.main_menu_kb())
+
+
+@router.message(Command("coach"))
+@router.message(F.text == kb.BTN_COACH)
+async def cmd_coach(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.update_data(coach_history=[])
+    await state.set_state(CoachChat.chatting)
+    await message.answer(
+        "Коуч на связи. Пиши, что на уме — обсудим, как у тебя дела с задачами.",
+        reply_markup=kb.coach_exit_kb(),
+    )
+
+
 # ==================== Быстрый захват: предложение запланировать ====================
 
 @router.callback_query(F.data.startswith("qc:"))
@@ -364,6 +400,16 @@ async def process_action(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=kb.contexts_kb(all_contexts, set()),
         )
 
+    elif action == "project":
+        await callback.answer()
+        project_id = await db.create_project(task["title"], task.get("description"))
+        await db.delete_task_safe(task_id)
+        await callback.message.edit_text(
+            f"📁 Создан проект «{task['title']}» (исходная задача перенесена в проект и удалена из Inbox).\n"
+            "Как разобьём на следующие действия?",
+            reply_markup=kb.project_breakdown_choice_kb(project_id),
+        )
+
 
 @router.callback_query(F.data.startswith("procdel:"))
 async def process_delete_confirm(callback: CallbackQuery) -> None:
@@ -401,6 +447,138 @@ async def process_waiting_whom_text(message: Message, state: FSMContext) -> None
         await _send_next_inbox_item(message)
     else:
         await _show_edit_field_menu(message, task_id, note=f"Теперь ждём: {whom} ⏳")
+
+
+# ==================== Разбивка проекта на действия (ИИ или вручную) ====================
+
+@router.callback_query(F.data.startswith("projbrk:ai:"))
+async def projbrk_ai_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer("Думаю над разбивкой…")
+    project_id = int(callback.data[len("projbrk:ai:"):])
+    project = await db.get_project(project_id)
+    if not project:
+        await callback.message.edit_text("Проект не найден.")
+        return
+    try:
+        actions = await ai_client.suggest_next_actions(project["name"], project.get("description"))
+    except ai_client.AIError as e:
+        logger.warning("Не удалось получить разбивку от ИИ: %s", e)
+        await callback.message.edit_text(
+            "🤖 ИИ сейчас недоступен. Хочешь добавить действия вручную?",
+            reply_markup=kb.ai_fallback_kb(project_id),
+        )
+        return
+    await state.update_data(project_id=project_id, suggestions=actions, suggestion_index=0, added_count=0)
+    await _show_next_suggestion(callback.message, state)
+
+
+async def _show_next_suggestion(target, state: FSMContext) -> None:
+    data = await state.get_data()
+    suggestions = data.get("suggestions", [])
+    idx = data.get("suggestion_index", 0)
+    if idx >= len(suggestions):
+        await _finish_breakdown(target, state)
+        return
+    await target.answer(
+        f"Действие {idx + 1}/{len(suggestions)}:\n«{suggestions[idx]}»",
+        reply_markup=kb.suggestion_review_kb(),
+    )
+
+
+async def _finish_breakdown(target, state: FSMContext) -> None:
+    data = await state.get_data()
+    added = data.get("added_count", 0)
+    project_id = data.get("project_id")
+    project = await db.get_project(project_id) if project_id else None
+    await state.clear()
+    name = project["name"] if project else "проекте"
+    await target.answer(f"Готово! Добавлено {added} действий в проект «{name}».", reply_markup=kb.main_menu_kb())
+
+
+@router.callback_query(F.data == "projbrk:accept")
+async def projbrk_accept(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer("Добавлено ✅")
+    data = await state.get_data()
+    suggestions = data.get("suggestions", [])
+    idx = data.get("suggestion_index", 0)
+    project_id = data.get("project_id")
+    if idx < len(suggestions):
+        await db.add_task(suggestions[idx], status="next_action", project_id=project_id)
+        await state.update_data(suggestion_index=idx + 1, added_count=data.get("added_count", 0) + 1)
+    await _show_next_suggestion(callback.message, state)
+
+
+@router.callback_query(F.data == "projbrk:reject")
+async def projbrk_reject(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer("Пропущено")
+    data = await state.get_data()
+    idx = data.get("suggestion_index", 0)
+    await state.update_data(suggestion_index=idx + 1)
+    await _show_next_suggestion(callback.message, state)
+
+
+@router.callback_query(F.data == "projbrk:edit")
+async def projbrk_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(ProjectBreakdown.editing_suggestion)
+    await callback.message.answer("Напиши исправленный текст действия:")
+
+
+@router.message(StateFilter(ProjectBreakdown.editing_suggestion))
+async def projbrk_edit_text(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    if not text:
+        await message.answer("Пусто. Напиши текст действия:")
+        return
+    data = await state.get_data()
+    idx = data.get("suggestion_index", 0)
+    project_id = data.get("project_id")
+    await db.add_task(text, status="next_action", project_id=project_id)
+    await state.set_state(None)
+    await state.update_data(suggestion_index=idx + 1, added_count=data.get("added_count", 0) + 1)
+    await _show_next_suggestion(message, state)
+
+
+@router.callback_query(F.data.startswith("projbrk:manual:"))
+async def projbrk_manual_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    project_id = int(callback.data[len("projbrk:manual:"):])
+    await state.update_data(project_id=project_id, added_count=0)
+    await state.set_state(ProjectBreakdown.entering_manual_action)
+    await callback.message.edit_text(
+        "Пиши следующие действия по одному, каждое отдельным сообщением.\n"
+        "Когда закончишь — нажми «Готово».",
+        reply_markup=kb.manual_action_entry_kb(),
+    )
+
+
+@router.message(StateFilter(ProjectBreakdown.entering_manual_action))
+async def projbrk_manual_text(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    if not text:
+        return
+    data = await state.get_data()
+    project_id = data.get("project_id")
+    await db.add_task(text, status="next_action", project_id=project_id)
+    added = data.get("added_count", 0) + 1
+    await state.update_data(added_count=added)
+    await message.answer(f"Добавлено ({added}): «{text}»", reply_markup=kb.manual_action_entry_kb())
+
+
+@router.callback_query(F.data == "projbrk:manualdone")
+async def projbrk_manual_done(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await _finish_breakdown(callback.message, state)
+
+
+@router.callback_query(F.data.startswith("projbrk:skip:"))
+async def projbrk_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    project_id = int(callback.data[len("projbrk:skip:"):])
+    project = await db.get_project(project_id)
+    name = project["name"] if project else "проект"
+    await callback.message.edit_text(f"Ок, проект «{name}» создан без действий.")
 
 
 # ==================== Планирование даты/времени (sched:*) ====================
@@ -1093,6 +1271,160 @@ async def done_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
     await callback.message.edit_text("Ок.")
+
+
+# ==================== /balance и статистика (переиспользуется и коучем) ====================
+
+async def _gather_stats(days: int) -> dict:
+    """Сырые данные за период — источник и для /balance, и для контекста коуча."""
+    end = utils.now_local()
+    start = end - timedelta(days=days)
+    start_iso = utils.dt_to_iso(start)
+    context_stats = await db.get_context_stats_since(start_iso)
+    stale_waiting = await db.list_stale_waiting_for(utils.dt_to_iso(end - timedelta(days=14)))
+    someday = await db.list_tasks_by_status("someday")
+    overdue = await db.list_overdue_tasks()
+    done_recent = await db.list_done_tasks_between(start_iso, utils.dt_to_iso(end))
+    return {
+        "days": days,
+        "context_stats": context_stats,
+        "stale_waiting": stale_waiting,
+        "someday_count": len(someday),
+        "overdue": overdue,
+        "done_count": len(done_recent),
+    }
+
+
+def _format_stats_text(stats: dict) -> str:
+    """Компактный текстовый блок для промпта — не сырой JSON."""
+    lines = [f"Период: последние {stats['days']} дней.", f"Выполнено задач: {stats['done_count']}."]
+    if stats["context_stats"]:
+        lines.append("По контекстам (создано/выполнено):")
+        for c in stats["context_stats"]:
+            lines.append(f"  @{c['name']}: создано {c['created']}, выполнено {c['done']}")
+    else:
+        lines.append("По контекстам данных нет.")
+    lines.append(f"В Someday/Maybe: {stats['someday_count']} задач.")
+    if stats["stale_waiting"]:
+        lines.append(f"В Waiting For дольше 2 недель: {len(stats['stale_waiting'])} задач —")
+        for t in stats["stale_waiting"][:10]:
+            whom = f" (ждём: {t['waiting_for_whom']})" if t.get("waiting_for_whom") else ""
+            lines.append(f"  «{t['title']}»{whom}")
+    else:
+        lines.append("Зависших в Waiting For больше 2 недель нет.")
+    if stats["overdue"]:
+        lines.append(f"Просрочено по дедлайну: {len(stats['overdue'])} задач —")
+        for t in stats["overdue"][:10]:
+            lines.append(f"  «{t['title']}» (дедлайн был {utils.format_dt(t['deadline'])})")
+    else:
+        lines.append("Просроченных задач нет.")
+    return "\n".join(lines)
+
+
+async def build_balance_report() -> str:
+    """Публичная функция — переиспользуется командой /balance и ежемесячным cron-джобом (main.py)."""
+    stats = await _gather_stats(30)
+    stats_text = _format_stats_text(stats)
+    try:
+        analysis = await ai_client.analyze_balance(stats_text)
+    except ai_client.AIError as e:
+        logger.warning("Не удалось получить анализ баланса от ИИ: %s", e)
+        return (
+            "⚖️ Статистика за 30 дней (ИИ-анализ сейчас недоступен, но цифры настоящие):\n\n"
+            + stats_text
+        )
+    return "⚖️ Баланс за 30 дней:\n\n" + analysis
+
+
+# ==================== Коуч (свободный чат с ИИ) ====================
+
+COACH_SYSTEM_PROMPT = """# Системный промпт: коуч по продуктивности
+
+## Роль
+
+Ты — коуч по личной продуктивности и тайм-менеджменту, работающий с пользователем через Telegram-бота на основе методологии GTD (Getting Things Done). Твоя работа синтезирует три проверенных подхода к организации работы и внимания:
+
+1. **GTD (Дэвид Аллен)** — систематический захват всего, что требует внимания, разбиение на конкретные следующие действия, регулярный пересмотр списков.
+
+2. **Управление вниманием и глубокая работа** — приоритизация задач, требующих концентрации, разделение задач по уровню вовлечённости, борьба с фрагментацией внимания.
+
+3. **Формирование устойчивых привычек** — маленькие последовательные шаги, отслеживание регулярности, а не разовых рывков.
+
+Сильные стороны каждого подхода объединены: чёткая структура захвата и обработки (GTD) + осознанная приоритизация по важности, а не только срочности + фокус на устойчивости системы, а не на разовой мотивации. Слабые стороны исключены: никакого перфекционизма в планировании, никакого давления через чувство вины, никаких абстрактных лозунгов без привязки к конкретным данным пользователя.
+
+## С какими данными работаешь
+
+Тебе на вход передаются реальные данные пользователя из бота: список задач по категориям (Inbox, Next Actions, Waiting For, Calendar, Someday/Maybe), контексты, приоритеты, дедлайны, история выполнения, статистика за период. Ты работаешь только с тем, что реально передано в контексте запроса. Если данных недостаточно для содержательного ответа — прямо скажи об этом и уточни, что нужно.
+
+## Тон и стиль
+
+Нейтрально-деловой. Без заигрывания, без избыточной мягкости, но и без давления и морализаторства. Обращение на "ты". Короткие, конкретные фразы. Ты не пытаешься мотивировать лозунгами — ты показываешь факты из данных пользователя и даёшь конкретный следующий шаг. Если пользователь ничего не делал неделю — констатируешь это без осуждения и спрашиваешь, что мешало, прежде чем давать советы.
+
+## Фокус ответа
+
+Ты не фокусируешься на одной теме заранее — каждый раз определяешь фокус исходя из того, что реально показывают данные пользователя в моменте: если видна прокрастинация — говоришь о ней, если распылание по мелким задачам без приоритета — о приоритизации, если дисбаланс между категориями — о балансе. Не пытайся охватить всё сразу в одном ответе — веди с тем, что наиболее релевантно текущему запросу и текущим данным.
+
+## Как формируешь ответ (chain of thought, не показывать пользователю)
+
+4. Разбери, какие данные тебе передали и что они реально показывают (без домыслов).
+
+5. Определи 1-2 паттерна, которые заметны именно в этих данных.
+
+6. Сформулируй наблюдение простыми словами, со ссылкой на конкретные цифры/задачи из данных.
+
+7. Дай один-два конкретных следующих шага — не общий совет, а то, что можно сделать сегодня или в ближайшие дни.
+
+8. Если пользователь задаёт прямой вопрос — сначала отвечаешь на него по существу, потом, если уместно, добавляешь наблюдение из данных.
+
+## Анти-галлюцинационный контур
+
+- Никогда не придумывай задачи, даты или цифры, которых нет в переданных данных.
+
+- Если в данных есть пробел (например, нет истории за период) — так и скажи, не заполняй домыслом.
+
+- Не давай медицинских, психиатрических или финансовых рекомендаций — при таких темах предложи обратиться к специалисту.
+
+- Не оценивай личность пользователя, только его систему организации задач и наблюдаемые паттерны поведения в данных.
+
+- Если пользователь просит что-то, что противоречит его же собственным целям, зафиксированным в системе — можешь это отметить прямо, без нравоучений, одной фразой.
+
+## Границы
+
+Ты не создаёшь и не удаляешь задачи напрямую в базе данных пользователя. Ты только советуешь — если пользователь хочет что-то добавить или изменить по итогам разговора, он делает это обычными командами бота. Ты не заменяешь профессиональную психологическую помощь при признаках выгорания или тревожности — в таком случае мягко порекомендуй обратиться к специалисту и не давай самостоятельных рекомендаций по этой части."""
+
+
+@router.message(StateFilter(CoachChat.chatting), F.text)
+async def coach_message(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    if not text:
+        await message.answer("Напиши текстом — коуч пока понимает только текст.", reply_markup=kb.coach_exit_kb())
+        return
+    data = await state.get_data()
+    history = data.get("coach_history", [])
+    stats = await _gather_stats(30)
+    context_data = _format_stats_text(stats)
+    try:
+        reply = await ai_client.coach_reply(COACH_SYSTEM_PROMPT, context_data, history, text)
+    except ai_client.AIError as e:
+        logger.warning("Коуч недоступен: %s", e)
+        await message.answer(
+            "🤖 Коуч сейчас не отвечает (проблема с ИИ). Попробуй ещё раз через минуту или жми «Закончить».",
+            reply_markup=kb.coach_exit_kb(),
+        )
+        return
+    history.append({"role": "user", "content": text})
+    history.append({"role": "assistant", "content": reply})
+    history = history[-config.COACH_HISTORY_LIMIT:]
+    await state.update_data(coach_history=history)
+    await message.answer(reply, reply_markup=kb.coach_exit_kb())
+
+
+@router.callback_query(F.data == "coach:exit")
+async def coach_exit(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await callback.message.edit_text("До связи.")
+    await callback.message.answer("Чем помочь дальше?", reply_markup=kb.main_menu_kb())
 
 
 # ==================== Служебное ====================

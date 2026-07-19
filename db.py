@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS contexts (
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    description TEXT,
     created_at TEXT NOT NULL,
     is_archived INTEGER NOT NULL DEFAULT 0
 );
@@ -47,7 +48,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     waiting_for_whom TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    status_changed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_contexts (
@@ -117,6 +119,19 @@ async def init_db() -> None:
     await _conn.executescript(SCHEMA)
     await _conn.commit()
 
+    # Лёгкие additive-миграции для БД, развёрнутых до появления этих колонок.
+    # ALTER TABLE ADD COLUMN не трогает существующие строки — безопасно для прод-данных.
+    for ddl in (
+        "ALTER TABLE tasks ADD COLUMN status_changed_at TEXT",
+        "ALTER TABLE projects ADD COLUMN description TEXT",
+    ):
+        try:
+            await _conn.execute(ddl)
+        except aiosqlite.OperationalError:
+            pass  # колонка уже есть
+    await _conn.execute("UPDATE tasks SET status_changed_at = created_at WHERE status_changed_at IS NULL")
+    await _conn.commit()
+
     cursor = await _conn.execute("SELECT COUNT(*) AS c FROM contexts WHERE is_builtin = 1")
     row = await cursor.fetchone()
     if row["c"] == 0:
@@ -163,12 +178,14 @@ async def set_owner_chat_id(chat_id: int) -> None:
 
 # ---------- tasks ----------
 
-async def add_task(title: str, description: str = None, status: str = "inbox") -> int:
+async def add_task(
+    title: str, description: str = None, status: str = "inbox", project_id: int = None
+) -> int:
     now = utils.dt_to_iso(utils.now_local())
     cursor = await _conn.execute(
-        "INSERT INTO tasks (title, description, status, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (title, description, status, now, now),
+        "INSERT INTO tasks (title, description, status, project_id, created_at, updated_at, status_changed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (title, description, status, project_id, now, now, now),
     )
     await _conn.commit()
     return cursor.lastrowid
@@ -192,8 +209,10 @@ async def update_task(task_id: int, **fields) -> None:
     if not changes:
         return
     changes["updated_at"] = utils.dt_to_iso(utils.now_local())
-    if changes.get("status") == "done":
-        changes["completed_at"] = utils.dt_to_iso(utils.now_local())
+    if "status" in changes:
+        changes["status_changed_at"] = changes["updated_at"]
+        if changes["status"] == "done":
+            changes["completed_at"] = changes["updated_at"]
     set_clause = ", ".join(f"{k} = ?" for k in changes)
     values = list(changes.values()) + [task_id]
     await _conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", values)
@@ -398,6 +417,65 @@ async def get_due_reminders(now_iso: str) -> list[dict]:
 async def mark_reminder_sent(reminder_id: int) -> None:
     await _conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
     await _conn.commit()
+
+
+# ---------- проекты ----------
+
+async def create_project(name: str, description: Optional[str] = None) -> int:
+    now = utils.dt_to_iso(utils.now_local())
+    cursor = await _conn.execute(
+        "INSERT INTO projects (name, description, created_at) VALUES (?, ?, ?)",
+        (name, description, now),
+    )
+    await _conn.commit()
+    return cursor.lastrowid
+
+
+async def get_project(project_id: int) -> Optional[dict]:
+    cursor = await _conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
+    row = await cursor.fetchone()
+    return _row_to_dict(row) if row else None
+
+
+# ---------- статистика для /balance и коуча ----------
+
+async def get_context_stats_since(start_iso: str) -> list[dict]:
+    """Сколько задач с каждым контекстом создано и сколько выполнено за период."""
+    cursor = await _conn.execute(
+        """
+        SELECT c.name AS name,
+               COUNT(DISTINCT CASE WHEN t.created_at >= ? THEN t.id END) AS created,
+               COUNT(DISTINCT CASE WHEN t.status = 'done' AND t.completed_at >= ? THEN t.id END) AS done
+        FROM contexts c
+        JOIN task_contexts tc ON tc.context_id = c.id
+        JOIN tasks t ON t.id = tc.task_id
+        GROUP BY c.id
+        HAVING created > 0 OR done > 0
+        ORDER BY created DESC
+        """,
+        (start_iso, start_iso),
+    )
+    return _rows_to_dicts(await cursor.fetchall())
+
+
+async def list_stale_waiting_for(threshold_iso: str) -> list[dict]:
+    """Задачи в Waiting For, не менявшие статус с threshold_iso или раньше."""
+    cursor = await _conn.execute(
+        "SELECT * FROM tasks WHERE status = 'waiting_for' AND status_changed_at <= ? "
+        "ORDER BY status_changed_at ASC",
+        (threshold_iso,),
+    )
+    return _rows_to_dicts(await cursor.fetchall())
+
+
+async def list_overdue_tasks() -> list[dict]:
+    now_iso = utils.dt_to_iso(utils.now_local())
+    cursor = await _conn.execute(
+        "SELECT * FROM tasks WHERE deadline IS NOT NULL AND deadline < ? AND status != 'done' "
+        "ORDER BY deadline ASC",
+        (now_iso,),
+    )
+    return _rows_to_dicts(await cursor.fetchall())
 
 
 # ---------- удаление с проверкой связанных данных ----------

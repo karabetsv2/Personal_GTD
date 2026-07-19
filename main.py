@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import config
 import db
 import utils
-from handlers import BOT_COMMANDS, router
+from handlers import BOT_COMMANDS, build_balance_report, router
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,19 @@ async def check_reminders(bot: Bot) -> None:
         await db.mark_reminder_sent(reminder["id"])
 
 
+async def send_monthly_balance(bot: Bot) -> None:
+    """Раз в месяц (1-е число, 09:00) присылает тот же отчёт, что и команда /balance."""
+    owner_chat_id = await db.get_owner_chat_id()
+    if owner_chat_id is None:
+        return
+    try:
+        report = await build_balance_report()
+    except Exception:
+        logger.exception("Не удалось сформировать ежемесячный отчёт баланса")
+        return
+    await bot.send_message(owner_chat_id, "📅 Ежемесячный обзор баланса\n\n" + report)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=config.LOG_LEVEL,
@@ -53,6 +66,14 @@ async def main() -> None:
         check_reminders,
         "interval",
         seconds=config.REMINDER_CHECK_INTERVAL_SECONDS,
+        args=(bot,),
+    )
+    scheduler.add_job(
+        send_monthly_balance,
+        "cron",
+        day=1,
+        hour=9,
+        minute=0,
         args=(bot,),
     )
     scheduler.start()
